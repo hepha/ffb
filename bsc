@@ -170,7 +170,6 @@ def load_data():
         messagebox.showerror("錯誤", f"無法操作數據檔案：{str(e)}")
         return pd.DataFrame(columns=["日期", "餘額積分", "交易積分", "消耗", "淨得分"])
 
-# 儲存數據並清理舊備份
 
 
 def save_data(df):
