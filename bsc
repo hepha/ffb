@@ -200,7 +200,6 @@ def save_data(df):
         logging.error(f"儲存數據失敗：{str(e)}")
         messagebox.showerror("錯誤", f"無法操作數據檔案：{str(e)}")
 
-# 儲存設定
 
 
 def save_settings(width, height, x, y, font_size):
