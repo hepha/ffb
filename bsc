@@ -144,7 +144,6 @@ def initialize_data_file():
         logging.error(f"初始化數據檔案失敗：{str(e)}")
         messagebox.showerror("錯誤", f"無法操作數據檔案：{str(e)}")
 
-# 載入數據
 
 
 def load_data():
