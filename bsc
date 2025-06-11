@@ -18,7 +18,6 @@ import winreg
 import sys
 import ctypes
 
-# 設置 DPI 感知，避免 Windows 縮放問題
 ctypes.windll.shcore.SetProcessDpiAwareness(1)
 
 # 檔案名稱
