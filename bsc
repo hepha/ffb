@@ -50,7 +50,6 @@ def is_already_running():
         logging.error(f"單一實例檢查失敗：{str(e)}")
         return False
 
-# 檢測系統主題
 
 
 def is_dark_theme():
