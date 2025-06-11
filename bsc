@@ -26,7 +26,6 @@ DATA_FILE = "alpha_points.csv"
 SETTINGS_FILE = "settings.json"
 LOG_FILE = "app.log"
 
-# 設置日誌，明確使用 UTF-8 編碼
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s",
                     encoding="utf-8")
