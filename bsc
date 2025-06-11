@@ -1,0 +1,794 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from tkcalendar import DateEntry
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+import json
+import logging
+import glob
+import re
+import win32gui
+import win32con
+import pystray
+from PIL import Image, ImageDraw, ImageFont
+import psutil
+import threading
+import winreg
+import sys
+import ctypes
+
+# 設置 DPI 感知，避免 Windows 縮放問題
+ctypes.windll.shcore.SetProcessDpiAwareness(1)
+
+# 檔案名稱
+DATA_FILE = "alpha_points.csv"
+SETTINGS_FILE = "settings.json"
+LOG_FILE = "app.log"
+
+# 設置日誌，明確使用 UTF-8 編碼
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s",
+                    encoding="utf-8")
+
+# 檢查單一實例
+
+
+def is_already_running():
+    try:
+        for proc in psutil.process_iter(['name', 'cmdline']):
+            try:
+                if proc.name() in ["python.exe", "pythonw.exe"]:
+                    cmdline = proc.cmdline()
+                    if len(cmdline) > 1 and os.path.basename(__file__) in cmdline[1]:
+                        hwnd = win32gui.FindWindow(None, "幣安 Alpha 積分計算器")
+                        if hwnd:
+                            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                            win32gui.SetForegroundWindow(hwnd)
+                            return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return False
+    except Exception as e:
+        logging.error(f"單一實例檢查失敗：{str(e)}")
+        return False
+
+# 檢測系統主題
+
+
+def is_dark_theme():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return value == 0
+    except Exception as e:
+        logging.error(f"無法檢測系統主題：{str(e)}")
+        return False
+
+# 創建文字圖標
+
+
+def create_text_icon(root, text="α", size=32):
+    try:
+        scale_factor = root.winfo_fpixels('1i') / 96
+        size = int(size * scale_factor)
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        text_color = "#D4D4D4" if is_dark_theme() else "#333333"
+        bg_color = "#2C2F33" if is_dark_theme() else "#F5F6F5"
+        draw.rectangle((0, 0, size, size), fill=bg_color)
+        font_paths = ["msyh.ttc", "arial.ttf", "segoeui.ttf", "tahoma.ttf"]
+        font = None
+        for font_path in font_paths:
+            try:
+                font = ImageFont.truetype(font_path, int(size * 0.65))
+                break
+            except IOError:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        text_x = (size - text_width) / 2
+        text_y = (size - text_height) / 2
+        draw.text((text_x, text_y), text, fill=text_color, font=font)
+        return image
+    except Exception as e:
+        logging.error(f"創建圖標失敗：{str(e)}")
+        return Image.new("RGBA", (32, 32), (0, 0, 0, 255))
+
+# 工具提示類
+
+
+class Tooltip:
+    def __init__(self, widget, text_func):
+        self.widget = widget
+        self.text_func = text_func
+        self.tooltip_window = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+
+    def show_tooltip(self, event=None):
+        try:
+            text = self.text_func()
+            if not text:
+                return
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + 20
+            self.tooltip_window = tk.Toplevel(self.widget)
+            self.tooltip_window.wm_overrideredirect(True)
+            self.tooltip_window.wm_geometry(f"+{x}+{y}")
+            label = tk.Label(self.tooltip_window, text=text,
+                             background="#3A3F47", fg="#D4D4D4",
+                             relief="solid", borderwidth=1, font=("微軟正黑體", 10))
+            label.pack()
+        except Exception as e:
+            logging.error(f"顯示工具提示失敗：{str(e)}")
+
+    def hide_tooltip(self, event=None):
+        try:
+            if self.tooltip_window:
+                self.tooltip_window.destroy()
+                self.tooltip_window = None
+        except Exception as e:
+            logging.error(f"隱藏工具提示失敗：{str(e)}")
+
+# 初始化數據檔案
+
+
+def initialize_data_file():
+    try:
+        if not os.access(os.path.dirname(DATA_FILE) or ".", os.W_OK):
+            raise PermissionError("無權限寫入數據檔案目錄")
+        if not os.path.exists(DATA_FILE):
+            df = pd.DataFrame(columns=["日期", "餘額積分", "交易積分", "消耗", "淨得分"])
+            df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
+            logging.info("數據檔案已初始化")
+    except Exception as e:
+        logging.error(f"初始化數據檔案失敗：{str(e)}")
+        messagebox.showerror("錯誤", f"無法操作數據檔案：{str(e)}")
+
+# 載入數據
+
+
+def load_data():
+    try:
+        df = pd.read_csv(DATA_FILE)
+        if not df.empty:
+            df["日期"] = pd.to_datetime(
+                df["日期"], format="%Y-%m-%d", errors="coerce")
+            if df["日期"].isna().any():
+                raise ValueError("CSV 檔案中的日期格式無效，請確保日期格式為 YYYY-MM-DD")
+            numeric_columns = ["餘額積分", "交易積分", "消耗", "淨得分"]
+            for col in numeric_columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+                if df[col].isna().any():
+                    raise ValueError(f"CSV 檔案中的 {col} 欄位包含無效數字")
+        logging.info("數據載入成功")
+        return df
+    except FileNotFoundError:
+        initialize_data_file()
+        return pd.read_csv(DATA_FILE)
+    except Exception as e:
+        logging.error(f"載入數據失敗：{str(e)}")
+        messagebox.showerror("錯誤", f"無法操作數據檔案：{str(e)}")
+        return pd.DataFrame(columns=["日期", "餘額積分", "交易積分", "消耗", "淨得分"])
+
+# 儲存數據並清理舊備份
+
+
+def save_data(df):
+    try:
+        if not os.access(os.path.dirname(DATA_FILE) or ".", os.W_OK):
+            raise PermissionError("無權限寫入數據檔案目錄")
+        today = datetime.now().strftime("%Y%m%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        if os.path.exists(DATA_FILE):
+            backup_file = DATA_FILE.replace(
+                ".csv", f"_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            os.rename(DATA_FILE, backup_file)
+            logging.info(f"備份已創建：{backup_file}")
+        df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
+        logging.info("數據儲存成功")
+        backup_files = sorted(
+            glob.glob("alpha_points_backup_*.csv"), key=os.path.getmtime)
+        for backup in backup_files[:-10]:
+            match = re.search(r"alpha_points_backup_(\d{8})_", backup)
+            if match:
+                backup_date = match.group(1)
+                if backup_date != today and backup_date != yesterday:
+                    try:
+                        os.remove(backup)
+                        logging.info(f"刪除舊備份：{backup}")
+                    except Exception as e:
+                        logging.error(f"刪除備份 {backup} 失敗：{str(e)}")
+    except Exception as e:
+        logging.error(f"儲存數據失敗：{str(e)}")
+        messagebox.showerror("錯誤", f"無法操作數據檔案：{str(e)}")
+
+# 儲存設定
+
+
+def save_settings(width, height, x, y, font_size):
+    try:
+        settings = {
+            "width": width,
+            "height": height,
+            "x": x,
+            "y": y,
+            "font_size": font_size
+        }
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+        logging.info("設定儲存成功")
+    except Exception as e:
+        logging.error(f"儲存設定失敗：{str(e)}")
+
+# 載入設定
+
+
+def load_settings():
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return None
+    except Exception as e:
+        logging.error(f"載入設定失敗：{str(e)}")
+        return None
+
+# 計算前一天的 15 天滾動積分（整數）
+
+
+def calculate_rolling_points(df, selected_date):
+    try:
+        df = df.dropna(subset=["日期"])
+        selected_date = pd.to_datetime(selected_date)
+        end_date = selected_date - timedelta(days=1)
+        start_date = end_date - timedelta(days=14)
+        mask = (df["日期"] >= start_date) & (df["日期"] <= end_date)
+        recent_data = df[mask]
+        rolling_points = int(
+            recent_data["淨得分"].sum()) if not recent_data.empty else 0
+        return rolling_points
+    except Exception as e:
+        logging.error(f"計算滾動積分失敗：{str(e)}")
+        return 0
+
+# GUI 類
+
+
+class AlphaPointsApp:
+    def __init__(self, root):
+        # --- 初始化開始 ---
+        try:
+            self.root = root
+            self.root.title("幣安 Alpha 積分計算器")
+            self.icon = None
+
+            # 初始字體大小
+            self.font_size = 12
+            self.base_font = ("微軟正黑體", self.font_size)
+
+            # 載入設定
+            settings = load_settings()
+            if settings:
+                self.root.geometry(
+                    f"{settings['width']}x{settings['height']}+{settings['x']}+{settings['y']}")
+                self.font_size = settings.get("font_size", 12)
+                self.base_font = ("微軟正黑體", self.font_size)
+            else:
+                self.root.geometry("600x400+100+100")
+
+            # 設置暗模式配色
+            background_color = "#2C2F33" if is_dark_theme() else "#F5F6F5"
+            foreground_color = "#D4D4D4" if is_dark_theme() else "#333333"
+            self.root.configure(bg=background_color)
+
+            # 按鈕與表格樣式
+            style = ttk.Style()
+            style.theme_use("clam")
+            style.configure("TButton",
+                            background="#5A7AEA",
+                            foreground="#D4D4D4",
+                            font=("微軟正黑體", self.font_size),
+                            borderwidth=1,
+                            relief="flat",
+                            padding=5)
+            style.map("TButton",
+                      background=[("active", "#4A6AD5")],
+                      foreground=[("active", "#D4D4D4")])
+            style.configure("Treeview.Heading",
+                            background="#5A7AEA",
+                            foreground="#D4D4D4",
+                            font=("微軟正黑體", self.font_size))
+            style.configure("Treeview",
+                            font=("微軟正黑體", self.font_size),
+                            rowheight=int(self.font_size * 2),
+                            background=background_color,
+                            fieldbackground=background_color,
+                            foreground=foreground_color)
+            style.map("Treeview",
+                      background=[("selected", "#5A7AEA")],
+                      foreground=[("selected", "#D4D4D4")])
+
+            # 初始化表格（無交替行色）
+            self.tree = ttk.Treeview(self.root, columns=(
+                "日期", "餘額積分", "交易積分", "消耗", "淨得分", "目前積分"), show="headings")
+
+            # 初始化數據檔案
+            initialize_data_file()
+            self.df = load_data()
+
+            # 設置系統托盤
+            self.setup_system_tray()
+
+            # 處理窗口關閉
+            self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+
+            # 輸入框架
+            self.input_frame = tk.Frame(self.root, bg=background_color)
+            self.input_frame.pack(pady=6, fill=tk.X)
+
+            # 日期選擇
+            self.label_date = tk.Label(
+                self.input_frame, text="選擇日期：", font=self.base_font, bg=background_color, fg=foreground_color)
+            self.label_date.pack(side=tk.LEFT, padx=6)
+            self.date_entry = DateEntry(self.input_frame, date_pattern="yyyy-mm-dd",
+                                        mindate=datetime.now() - timedelta(days=365),
+                                        maxdate=datetime.now() + timedelta(days=365),
+                                        font=self.base_font, background="#3A3F47",
+                                        foreground=foreground_color, selectbackground="#5A7AEA",
+                                        selectforeground="#D4D4D4")
+            self.date_entry.pack(side=tk.LEFT, padx=6)
+            self.date_entry.set_date(datetime.now())
+
+            # 清除數據按鈕
+            self.button_clear = ttk.Button(
+                self.input_frame, text="清除資料", command=self.clear_selected_date_data)
+            self.button_clear.pack(side=tk.LEFT, padx=6)
+
+            # 餘額
+            self.label_balance = tk.Label(
+                self.input_frame, text="餘額：", font=self.base_font, bg=background_color, fg=foreground_color)
+            self.label_balance.pack(side=tk.LEFT, padx=6)
+            self.entry_balance = tk.Entry(
+                self.input_frame, width=4, font=self.base_font, bg="#3A3F47", fg=foreground_color,
+                insertbackground="#D4D4D4")
+            self.entry_balance.pack(side=tk.LEFT, padx=6)
+            self.entry_balance.insert(0, "")
+
+            # 交易
+            self.label_trade = tk.Label(
+                self.input_frame, text="交易：", font=self.base_font, bg=background_color, fg=foreground_color)
+            self.label_trade.pack(side=tk.LEFT, padx=6)
+            self.entry_trade = tk.Entry(
+                self.input_frame, width=4, font=self.base_font, bg="#3A3F47", fg=foreground_color,
+                insertbackground="#D4D4D4")
+            self.entry_trade.pack(side=tk.LEFT, padx=6)
+            self.entry_trade.insert(0, "")
+
+            # 消耗
+            self.label_consumption = tk.Label(
+                self.input_frame, text="消耗：", font=self.base_font, bg=background_color, fg=foreground_color)
+            self.label_consumption.pack(side=tk.LEFT, padx=6)
+            self.entry_consumption = tk.Entry(
+                self.input_frame, width=4, font=self.base_font, bg="#3A3F47", fg=foreground_color,
+                insertbackground="#D4D4D4")
+            self.entry_consumption.pack(side=tk.LEFT, padx=6)
+            self.entry_consumption.insert(0, "")
+
+            # 限制輸入為整數 (0-99)
+            self.restrict_entry_to_integers()
+
+            # 綁定 Enter 鍵
+            self.entry_balance.bind(
+                "<Return>", lambda event: self.calculate_and_save())
+            self.entry_trade.bind(
+                "<Return>", lambda event: self.calculate_and_save())
+            self.entry_consumption.bind(
+                "<Return>", lambda event: self.calculate_and_save())
+
+            # 綁定日期變更
+            self.date_entry.bind("<<DateEntrySelected>>",
+                                 self.update_entries_by_date)
+
+            # 控制框架
+            self.control_frame = tk.Frame(self.root, bg=background_color)
+            self.control_frame.pack(pady=0, anchor=tk.W)
+
+            # 計算按鈕
+            self.button_calculate = ttk.Button(
+                self.control_frame, text="計算並儲存", command=self.calculate_and_save)
+            self.button_calculate.pack(side=tk.LEFT, padx=6)
+
+            # 目前積分顯示
+            self.result_frame = tk.Frame(
+                self.control_frame, bg=background_color)
+            self.result_frame.pack(side=tk.LEFT, padx=6)
+
+            self.label_result_text = tk.Label(
+                self.result_frame, text="目前積分？", font=self.base_font, bg=background_color, fg=foreground_color)
+            self.label_result_text.pack(side=tk.LEFT)
+
+            self.label_result_value = tk.Label(
+                self.result_frame, text="-", font=("微軟正黑體", self.font_size, "bold"), fg="#D32F2F",
+                bg=background_color)
+            self.label_result_value.pack(side=tk.LEFT)
+
+            def get_date_range():
+                selected_date = pd.to_datetime(self.date_entry.get_date())
+                end_date = selected_date - timedelta(days=1)
+                start_date = end_date - timedelta(days=14)
+                return f"過去15天是從 {start_date.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')}"
+            Tooltip(self.label_result_text, get_date_range)
+
+            # 字體調整
+            self.label_font = tk.Label(
+                self.control_frame, text="字體：", font=self.base_font, bg=background_color, fg=foreground_color)
+            self.label_font.pack(side=tk.LEFT, padx=6)
+            self.button_increase_font = ttk.Button(
+                self.control_frame, text="+", command=self.increase_font_size)
+            self.button_increase_font.pack(side=tk.LEFT, padx=6)
+            self.button_decrease_font = ttk.Button(
+                self.control_frame, text="-", command=self.decrease_font_size)
+            self.button_decrease_font.pack(side=tk.LEFT, padx=6)
+
+            # 數據表格
+            self.tree.heading("日期", text="日期", anchor=tk.W,
+                              command=lambda: self.sort_table("日期", False))
+            self.tree.heading("餘額積分", text="餘額", anchor=tk.CENTER)
+            self.tree.heading("交易積分", text="交易", anchor=tk.CENTER)
+            self.tree.heading("消耗", text="消耗", anchor=tk.CENTER)
+            self.tree.heading("淨得分", text="淨得分", anchor=tk.CENTER)
+            self.tree.heading("目前積分", text="目前積分", anchor=tk.CENTER)
+
+            self.tree.column("日期", width=100, anchor=tk.W)
+            self.tree.column("餘額積分", width=60, anchor=tk.CENTER)
+            self.tree.column("交易積分", width=60, anchor=tk.CENTER)
+            self.tree.column("消耗", width=60, anchor=tk.CENTER)
+            self.tree.column("淨得分", width=60, anchor=tk.CENTER)
+            self.tree.column("目前積分", width=80, anchor=tk.CENTER)
+            self.tree.pack(fill=tk.BOTH, expand=True, pady=6)
+
+            self.tree.bind("<Double-1>", self.on_double_click)
+
+            self.sort_column = "日期"
+            self.sort_reverse = False
+
+            self.update_rolling_points_column()
+            self.load_table()
+            self.update_entries_by_date()
+
+            logging.info("應用程式初始化完成")
+        except Exception as e:
+            logging.error(f"初始化失敗：{str(e)}")
+            messagebox.showerror("錯誤", f"初始化錯誤：{str(e)}")
+            sys.exit(1)
+        # --- 初始化結束 ---
+
+    def setup_system_tray(self):
+        try:
+            image = create_text_icon(self.root, text="α", size=32)
+            menu = (
+                pystray.MenuItem("隱藏窗口", self.hide_window),
+                pystray.MenuItem("退出", self.exit_app)
+            )
+            self.icon = pystray.Icon(
+                "AlphaPoints", image, "幣安 Alpha 積分計算器", menu)
+            # 綁定雙擊事件
+            self.icon.on_double_click = lambda icon: self.show_window(icon)
+            tray_thread = threading.Thread(target=self.icon.run, daemon=True)
+            tray_thread.start()
+            tray_thread.join(0.1)
+            if not tray_thread.is_alive():
+                raise RuntimeError("系統托盤線程啟動失敗")
+            logging.info("系統托盤初始化成功")
+        except Exception as e:
+            logging.error(f"系統托盤初始化失敗：{str(e)}")
+            messagebox.showwarning("警告", f"系統托盤初始化失敗：{str(e)}，請檢查後重試")
+
+    def show_window(self, icon=None):
+        try:
+            logging.info("雙擊托盤圖標，嘗試顯示窗口")
+            if not self.root.winfo_exists():
+                logging.error("窗口已被銷毀，無法恢復")
+                messagebox.showerror("錯誤", "窗口已被銷毀，請重啟應用程式")
+                return
+            self.root.deiconify()
+            self.root.update()  # 強制更新窗口狀態
+            self.root.lift()
+            self.root.focus_force()
+            try:
+                hwnd = self.root.winfo_id()
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(hwnd)
+                logging.info("窗口恢復成功 (win32gui)")
+            except Exception as win32_error:
+                logging.warning(
+                    f"win32gui 恢復窗口失敗：{str(win32_error)}，使用 Tkinter 恢復")
+                self.root.attributes('-topmost', True)
+                self.root.attributes('-topmost', False)
+                logging.info("窗口恢復成功 (Tkinter)")
+        except Exception as e:
+            logging.error(f"顯示窗口失敗：{str(e)}")
+            messagebox.showerror("錯誤", f"無法顯示窗口：{str(e)}")
+
+    def hide_window(self):
+        try:
+            self.root.withdraw()
+            logging.info("窗口已隱藏")
+        except Exception as e:
+            logging.error(f"隱藏窗口失敗：{str(e)}")
+
+    def exit_app(self):
+        try:
+            if self.icon:
+                self.icon.stop()
+            width = self.root.winfo_width()
+            height = self.root.winfo_height()
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            save_settings(width, height, x, y, self.font_size)
+            self.root.destroy()
+            logging.info("應用程式退出成功")
+        except Exception as e:
+            logging.error(f"退出應用程式失敗：{str(e)}")
+            sys.exit(1)
+
+    def restrict_entry_to_integers(self):
+        def validate_number(char, entry_value):
+            if char == "":
+                return True
+            if not char.isdigit():
+                return False
+            if len(entry_value) > 2:
+                return False
+            value = int(entry_value) if entry_value else 0
+            return 0 <= value <= 99
+        validate_cmd = (self.root.register(validate_number), "%S", "%P")
+        self.entry_balance.config(validate="key", validatecommand=validate_cmd)
+        self.entry_trade.config(validate="key", validatecommand=validate_cmd)
+        self.entry_consumption.config(
+            validate="key", validatecommand=validate_cmd)
+
+    def sort_table(self, col, reverse):
+        try:
+            self.sort_column = col
+            self.sort_reverse = reverse
+            self.load_table()
+            self.tree.heading(
+                col, command=lambda: self.sort_table(col, not reverse))
+        except Exception as e:
+            logging.error(f"表格排序失敗：{str(e)}")
+
+    def on_double_click(self, event):
+        try:
+            selected_item = self.tree.selection()
+            if not selected_item:
+                return
+            item = self.tree.item(selected_item)
+            values = item["values"]
+            if not values:
+                return
+            date_str = values[0]
+            balance = int(float(values[1]))
+            trade = int(float(values[2]))
+            consumption = int(float(values[3]))
+            date = pd.to_datetime(date_str)
+            self.date_entry.set_date(date)
+            self.entry_balance.delete(0, tk.END)
+            self.entry_balance.insert(0, str(balance))
+            self.entry_trade.delete(0, tk.END)
+            self.entry_trade.insert(0, str(trade))
+            self.entry_consumption.delete(0, tk.END)
+            self.entry_consumption.insert(0, str(consumption))
+            rolling_points = calculate_rolling_points(self.df, date)
+            self.label_result_value.config(text=f"{rolling_points}")
+            self.entry_balance.focus_set()
+        except Exception as e:
+            logging.error(f"表格雙擊事件失敗：{str(e)}")
+            messagebox.showerror("錯誤", "請輸入有效的數字（0-99）！")
+
+    def increase_font_size(self):
+        try:
+            if self.font_size < 20:
+                self.font_size += 1
+                self.update_fonts()
+        except Exception as e:
+            logging.error(f"增加字體大小失敗：{str(e)}")
+
+    def decrease_font_size(self):
+        try:
+            if self.font_size > 8:
+                self.font_size -= 1
+                self.update_fonts()
+        except Exception as e:
+            logging.error(f"減少字體大小失敗：{str(e)}")
+
+    def update_fonts(self):
+        try:
+            self.base_font = ("微軟正黑體", self.font_size)
+            widgets = [
+                self.label_date, self.date_entry, self.button_clear,
+                self.label_balance, self.entry_balance,
+                self.label_trade, self.entry_trade,
+                self.label_consumption, self.entry_consumption,
+                self.button_calculate, self.label_result_text,
+                self.label_font, self.button_increase_font, self.button_decrease_font
+            ]
+            for widget in widgets:
+                widget.config(font=self.base_font)
+            self.label_result_value.config(
+                font=("微軟正黑體", self.font_size, "bold"))
+            style = ttk.Style()
+            style.configure("Treeview.Heading", font=self.base_font)
+            style.configure("Treeview", font=self.base_font,
+                            rowheight=int(self.font_size * 2))
+            save_settings(self.root.winfo_width(), self.root.winfo_height(),
+                          self.root.winfo_x(), self.root.winfo_y(),
+                          self.font_size)
+        except Exception as e:
+            logging.error(f"更新字體失敗：{str(e)}")
+
+    def clear_selected_date_data(self):
+        try:
+            selected_date = pd.to_datetime(self.date_entry.get_date())
+            date_str = selected_date.strftime("%Y-%m-%d")
+            if (self.df["日期"].dt.date == selected_date.date()).any():
+                if not messagebox.askyesno("確認", f"確定要清除 {date_str} 的數據？"):
+                    return
+                self.df = self.df[self.df["日期"].dt.date !=
+                                  selected_date.date()]
+                self.update_rolling_points_column()
+                save_data(self.df)
+                self.sort_column = "日期"
+                self.sort_reverse = False
+                self.load_table()
+                self.entry_balance.delete(0, tk.END)
+                self.entry_trade.delete(0, tk.END)
+                self.entry_consumption.delete(0, tk.END)
+                rolling_points = calculate_rolling_points(
+                    self.df, selected_date)
+                self.label_result_value.config(text=f"{rolling_points}")
+                self.entry_balance.focus_set()
+        except Exception as e:
+            logging.error(f"清除數據失敗：{str(e)}")
+            messagebox.showerror("錯誤", "清除數據失敗！")
+
+    def update_entries_by_date(self, event=None):
+        try:
+            self.entry_balance.delete(0, tk.END)
+            self.entry_trade.delete(0, tk.END)
+            self.entry_consumption.delete(0, tk.END)
+            selected_date = pd.to_datetime(self.date_entry.get_date())
+            if (self.df["日期"].dt.date == selected_date.date()).any():
+                row = self.df[self.df["日期"].dt.date ==
+                              selected_date.date()].iloc[0]
+                self.entry_balance.insert(0, str(int(row["餘額積分"])))
+                self.entry_trade.insert(0, str(int(row["交易積分"])))
+                self.entry_consumption.insert(0, str(int(row["消耗"])))
+            else:
+                self.entry_balance.insert(0, "")
+                self.entry_trade.insert(0, "")
+                self.entry_consumption.insert(0, "")
+            rolling_points = calculate_rolling_points(self.df, selected_date)
+            self.label_result_value.config(text=f"{rolling_points}")
+            self.sort_column = "日期"
+            self.sort_reverse = False
+            self.load_table()
+        except Exception as e:
+            logging.error(f"更新日期輸入失敗：{str(e)}")
+            messagebox.showerror("錯誤", "更新日期數據失敗！")
+
+    def update_rolling_points_column(self):
+        try:
+            if self.df.empty:
+                return
+            self.df["目前積分"] = 0
+            for i, row in self.df.iterrows():
+                date = row["日期"]
+                rolling_points = calculate_rolling_points(self.df, date)
+                self.df.at[i, "目前積分"] = rolling_points
+        except Exception as e:
+            logging.error(f"更新滾動積分欄失敗：{str(e)}")
+
+    def load_table(self):
+        try:
+            selected_date = pd.to_datetime(self.date_entry.get_date())
+            start_date = selected_date - timedelta(days=15)
+            mask = (self.df["日期"] >= start_date) & (
+                self.df["日期"] <= selected_date)
+            filtered_df = self.df[mask].sort_values(
+                by="日期", ascending=True)
+
+            # 清空表格
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            # 填充表格（無交替行色）
+            for index, row in filtered_df.iterrows():
+                date = row["日期"].strftime("%Y-%m-%d")
+                values = (
+                    date,
+                    f"{int(row['餘額積分'])}",
+                    f"{int(row['交易積分'])}",
+                    f"{int(row['消耗'])}",
+                    f"{int(row['淨得分'])}",
+                    f"{int(row.get('目前積分', 0))}"
+                )
+                self.tree.insert("", tk.END, values=values)
+        except Exception as e:
+            logging.error(f"載入表格失敗：{str(e)}")
+            messagebox.showerror("錯誤", "載入表格數據失敗！")
+
+    def calculate_and_save(self):
+        try:
+            date = pd.to_datetime(self.date_entry.get_date())
+            date_str = date.strftime("%Y-%m-%d")
+            balance_str = self.entry_balance.get().strip()
+            trade_str = self.entry_trade.get().strip()
+            consumption_str = self.entry_consumption.get().strip()
+            if not balance_str and not trade_str and not consumption_str:
+                messagebox.showerror("錯誤", "請至少輸入一個數字！")
+                return False
+            balance = int(balance_str) if balance_str else 0
+            trade = int(trade_str) if trade_str else 0
+            consumption = int(consumption_str) if consumption_str else 0
+            if balance < 0 or trade < 0 or consumption < 0:
+                messagebox.showerror("錯誤", "積分和消耗不能為負數！")
+                return False
+            if balance > 99 or trade > 99 or consumption > 99:
+                messagebox.showerror("錯誤", "請輸入有效的數字（0-99）！")
+                return False
+            daily_score = balance + trade
+            net_score = daily_score - consumption
+            self.df = self.df[self.df["日期"].dt.date != date.date()]
+            new_row = pd.DataFrame({
+                "日期": [date],
+                "餘額積分": [balance],
+                "交易積分": [trade],
+                "消耗": [consumption],
+                "淨得分": [net_score]
+            })
+            self.df = pd.concat([self.df, new_row], ignore_index=True)
+            self.df.sort_values(by="日期", inplace=True)
+            self.update_rolling_points_column()
+            save_data(self.df)
+            rolling_points = calculate_rolling_points(self.df, date)
+            self.label_result_value.config(text=f"{rolling_points}")
+            self.sort_column = "日期"
+            self.sort_reverse = False
+            self.load_table()
+            if not self.df.empty:
+                last_date = pd.to_datetime(self.df["日期"]).max()
+                self.date_entry.set_date(last_date + timedelta(days=1))
+            self.entry_balance.delete(0, tk.END)
+            self.entry_trade.delete(0, tk.END)
+            self.entry_consumption.delete(0, tk.END)
+            self.entry_balance.focus_set()
+            logging.info(
+                f"數據儲存成功，日期：{date}，淨得分：{net_score}")
+            return True
+        except Exception as e:
+            logging.error(f"計算並儲存失敗：{str(e)}")
+            messagebox.showerror("錯誤", "請輸入有效的數字（0-99）！")
+            return False
+
+
+# 主程式
+if __name__ == "__main__":
+    try:
+        if is_already_running():
+            logging.info("應用程式已在運行，退出")
+            sys.exit()
+        root = tk.Tk()
+        app = AlphaPointsApp(root)
+        root.mainloop()
+    except Exception as e:
+        logging.error(f"主程式啟動失敗：{str(e)}")
+        messagebox.showerror("錯誤", f"應用程式啟動失敗：{str(e)}")
+        sys.exit(1)
