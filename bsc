@@ -63,7 +63,6 @@ def is_dark_theme():
         logging.error(f"無法檢測系統主題：{str(e)}")
         return False
 
-# 創建文字圖標
 
 
 def create_text_icon(root, text="α", size=32):
