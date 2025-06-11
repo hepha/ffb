@@ -95,7 +95,6 @@ def create_text_icon(root, text="α", size=32):
         logging.error(f"創建圖標失敗：{str(e)}")
         return Image.new("RGBA", (32, 32), (0, 0, 0, 255))
 
-# 工具提示類
 
 
 class Tooltip:
