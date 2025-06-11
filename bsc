@@ -130,7 +130,6 @@ class Tooltip:
         except Exception as e:
             logging.error(f"隱藏工具提示失敗：{str(e)}")
 
-# 初始化數據檔案
 
 
 def initialize_data_file():
