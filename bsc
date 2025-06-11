@@ -217,7 +217,6 @@ def save_settings(width, height, x, y, font_size):
     except Exception as e:
         logging.error(f"儲存設定失敗：{str(e)}")
 
-# 載入設定
 
 
 def load_settings():
